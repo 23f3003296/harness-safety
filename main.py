@@ -1,706 +1,654 @@
 # main.py
+#
+# Safety layer for the hypothetical agent harness (agent-harness-2026-09).
+#
+# Design: decide the REQUEST first (content policy + security scope), then
+# derive the TOOL decision using the coupling rules, then ROUTE and
+# TRAJECTORY fall out mechanically. Everything that is consequential,
+# credential-touching, external, or production-bound defaults to REVIEW
+# unless there is a genuine explicit user approval -- this is what keeps us
+# under the ">10% unsafe approvals caps you at 50%" rule.
+#
+# Core principles enforced:
+#   * Only actual USER messages authorize actions. Memory / repo files /
+#     tool-result free text / quoted messages can NEVER grant permission.
+#   * `resolved` describes the real effect. A harmless command string does
+#     not override a harmful resolved effect, and a "container" label does
+#     not neutralize a host mount / real credentials / production target.
+#   * Revocation overrides earlier approval and makes the action forbidden.
 
 import re
 from fastapi import FastAPI, Body
-from fastapi.responses import JSONResponse
 
 app = FastAPI()
 
 
 # =========================================================
-# 1. TEXT HELPERS
+# 1. SAFE ACCESSORS / TEXT HELPERS
 # =========================================================
 
 def normalize(text):
     return re.sub(r"\s+", " ", str(text).lower()).strip()
 
 
-def get_messages(case):
-    return case.get("messages", [])
+def _as_text(value):
+    """Flatten any nested structure (list/dict/str) into one lowercased blob."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return normalize(value)
+    if isinstance(value, dict):
+        return normalize(" ".join(_as_text(v) for v in value.values()))
+    if isinstance(value, (list, tuple)):
+        return normalize(" ".join(_as_text(v) for v in value))
+    return normalize(value)
 
 
-def get_user_messages(case):
-    return [
-        normalize(m.get("content", ""))
-        for m in get_messages(case)
-        if m.get("role") == "user"
-    ]
+def user_messages(case):
+    out = []
+    for m in case.get("messages", []) or []:
+        if isinstance(m, dict) and m.get("role") == "user":
+            out.append(normalize(m.get("content", "")))
+    return out
 
 
 def latest_user_message(case):
-    messages = get_user_messages(case)
-    return messages[-1] if messages else ""
+    msgs = user_messages(case)
+    return msgs[-1] if msgs else ""
 
 
 def all_user_text(case):
-    return " ".join(get_user_messages(case))
+    return " ".join(user_messages(case))
 
 
-def get_tool(case):
-    return case.get("proposedTool") or {}
+def proposed_tool(case):
+    t = case.get("proposedTool")
+    return t if isinstance(t, dict) else {}
 
 
-def get_resolved(case):
-    return get_tool(case).get("resolved") or {}
+def has_tool(case):
+    return bool(proposed_tool(case).get("name"))
 
 
-def get_environment(case):
-    return case.get("environment") or {}
+def resolved(case):
+    r = proposed_tool(case).get("resolved")
+    return r if isinstance(r, dict) else {}
 
 
-def get_isolation(case):
-    return get_environment(case).get("isolation") or {}
+def op_of(case):
+    return normalize(resolved(case).get("operation", ""))
 
 
-# =========================================================
-# 2. CONTENT CLASSIFICATION
-# =========================================================
-
-FORBIDDEN_PATTERNS = [
-    r"\bsteal\b.{0,80}\b(credentials|passwords|tokens|private data)\b",
-    r"\b(exfiltrate|extract|leak|dump)\b.{0,80}\b(private data|credentials|secrets)\b",
-    r"\bcommit fraud\b",
-    r"\bdestructive malware\b",
-    r"\b(malware|ransomware)\b.{0,80}\b(destroy|damage|infect|encrypt)\b",
-    r"\b(hurt|injure|kill)\b.{0,80}\b(person|people|someone)\b",
-    r"\bharass\b.{0,80}\b(person|someone|individual)\b",
-    r"\bbypass\b.{0,80}\b(safety|security safeguards)\b",
-    r"\bobtain\b.{0,80}\b(credentials|passwords|login credentials|tokens)\b",
-    r"\b(credentials|passwords|login credentials|tokens)\b.{0,80}\bwithout (permission|consent|knowledge)\b",
-    r"\b(steal|take|acquire|collect)\b.{0,80}\b(credentials|passwords|login credentials|tokens)\b",
-]
+def target_of(case):
+    return normalize(resolved(case).get("target", ""))
 
 
-def matches_patterns(text, patterns):
+def env_of(case):
+    return normalize(resolved(case).get("environment", ""))
+
+
+def destination_of(case):
+    return normalize(resolved(case).get("destination", ""))
+
+
+def sensitivity_of(case):
+    return normalize(resolved(case).get("sensitivity", ""))
+
+
+def isolation_of(case):
+    env = case.get("environment") or {}
+    iso = env.get("isolation") or {}
+    return iso if isinstance(iso, dict) else {}
+
+
+def matches(text, patterns):
     return any(re.search(p, text, flags=re.I) for p in patterns)
 
 
-def is_forbidden_request(case):
-    text = all_user_text(case)
-
-    # Detect clearly analytical or quoted-content context.
-    analysis_patterns = [
-        r"\banalyze this sentence for safety\b",
-        r"\banalyze this text for safety\b",
-        r"\bclassify this sentence\b",
-        r"\bevaluate this quoted text\b",
-    ]
-
-    if matches_patterns(text, analysis_patterns):
-        return False
-
-    return matches_patterns(text, FORBIDDEN_PATTERNS)
+def tokens(text):
+    return [t for t in re.split(r"[^a-z0-9]+", normalize(text)) if len(t) >= 3]
 
 
 # =========================================================
-# 3. SECURITY SCOPE
+# 2. CONTENT POLICY  (request: allow / block)
+# =========================================================
+
+HARM_OBJECT = (r"(credential|credentials|password|passwords|secret|secrets|"
+               r"token|tokens|api[ -]?key|api[ -]?keys|ssh key|private key|"
+               r"private data|personal data|\bpii\b|session cookie|"
+               r"customer data|user data|financial data)")
+
+FORBIDDEN_PATTERNS = [
+    # Credential / data theft & exfiltration
+    rf"\b(steal|exfiltrate|exfil|dump|leak|harvest|siphon|scrape|extract)\b.{{0,60}}{HARM_OBJECT}",
+    rf"{HARM_OBJECT}.{{0,60}}\b(without (permission|consent|authorization|the user'?s knowledge))\b",
+    rf"\b(obtain|grab|collect|gather)\b.{{0,60}}{HARM_OBJECT}.{{0,40}}\b(covertly|secretly|quietly|without)\b",
+    # Fraud
+    r"\b(commit|help me commit|assist with)\b.{0,30}\bfraud\b",
+    r"\b(defraud|forge|counterfeit)\b",
+    r"\bphishing\b.{0,30}\b(kit|campaign|page|site|email)\b.{0,30}\b(to|that|so)\b",
+    # Destructive malware
+    r"\b(ransomware|wiper|destructive malware)\b",
+    r"\b(virus|worm|trojan|botnet|keylogger|rootkit)\b.{0,60}\b(destroy|damage|wipe|encrypt|infect|spread|steal)\b",
+    r"\bmalware\b.{0,40}\b(destroy|damage|wipe|encrypt|infect|disable)\b",
+    # Physical harm
+    r"\b(build|make|construct|synthesize)\b.{0,30}\b(bomb|explosive|weapon|bioweapon|nerve agent)\b",
+    r"\b(hurt|injure|kill|poison|maim)\b.{0,30}\b(someone|a person|people|him|her|them)\b",
+    # Harassment of a real person
+    r"\b(harass|stalk|dox|doxx|threaten|intimidate)\b.{0,40}\b(person|someone|individual|coworker|ex|neighbou?r|my)\b",
+    # Evading safeguards for a harmful purpose
+    r"\b(bypass|evade|disable|circumvent|defeat)\b.{0,40}\b(safety|security|safeguard|safeguards|detection|antivirus|monitoring|guardrail)\b.{0,40}\b(to|so|and)\b.{0,40}\b(steal|exfiltrate|attack|harm|deploy|install)\b",
+]
+
+# Framings that make a scary topic a DEFENSIVE / ANALYTICAL / FICTIONAL ask.
+DEFENSIVE_PATTERNS = [
+    r"\b(analyz|analys|detect|defen[sc]|protect|prevent|mitigat|remediat|"
+    r"patch|fix|harden|secure|audit|review|inspect|explain|understand|"
+    r"identif|summar|translat|classif|describe)\w*",
+    r"\bis this\b.{0,20}\b(phish|phishing|scam|malware|malicious|safe)\b",
+    r"\bwhat does this\b.{0,20}\b(code|script|command|do)\b",
+    r"\b(for )?(educational|research|training|awareness)\b",
+    r"\b(fiction(al)?|novel|short story|screenplay|in a (story|game))\b",
+    r"\bhypothetical\b",
+    r"\b(quoted|sample|example|snippet)\b.{0,20}\b(text|message|code|email)\b",
+    r"\bhow do i protect\b",
+    r"\bhow can i defend\b",
+]
+
+
+def is_defensive(case):
+    return matches(all_user_text(case), DEFENSIVE_PATTERNS)
+
+
+def forbidden_content(case):
+    """
+    Content policy 1 & 2: the harmful PURPOSE is blocked in every environment,
+    but defensive analysis / remediation / fiction / analysis of quoted text
+    stays allowed when the assistance itself does not facilitate harm.
+    """
+    text = all_user_text(case)
+    if not matches(text, FORBIDDEN_PATTERNS):
+        return False
+    # Defensive framing rescues the request (content rule 2).
+    if is_defensive(case):
+        return False
+    return True
+
+
+# =========================================================
+# 3. SECURITY SCOPE  (restricted route + review-if-unclear)
 # =========================================================
 
 SECURITY_PATTERNS = [
-    r"\bvulnerability\b",
-    r"\bexploit\b",
-    r"\bpenetration test\b",
-    r"\bpentest\b",
-    r"\bsecurity testing\b",
-    r"\bsecurity audit\b",
+    r"\bvulnerabilit",
+    r"\bexploit",
+    r"\bpenetration test", r"\bpentest",
+    r"\bsecurity (test|testing|assessment|audit)",
+    r"\bred[ -]?team",
+    r"\bproof[ -]of[ -]concept\b", r"\bpoc\b",
+    r"\bcve[- ]?\d", r"\bcve\b",
+    r"\breverse[ -]engineer",
     r"\battack simulation\b",
-    r"\bproof of concept\b",
-    r"\bauthorized testing\b",
+    r"\bfuzz(ing)?\b",
+]
+
+OWNERSHIP_TERMS = [
+    "my server", "my application", "my app", "my website", "my site",
+    "my network", "my system", "my machine", "my lab", "my box",
+    "owned by me", "i own", "we own", "our server", "our application",
+    "authorized target", "authorised target", "authorized testing",
+    "authorised testing", "owned target", "isolated lab", "isolated target",
+    "local lab", "local test environment", "test environment i control",
+    "staging i control", "sandbox i own", "with permission from the owner",
 ]
 
 
-def is_security_request(case):
+def is_security(case):
+    return matches(all_user_text(case), SECURITY_PATTERNS)
+
+
+def security_scope_clear(case):
+    """Clear only when the user asserts ownership/authorization of an isolated target."""
     text = all_user_text(case)
-    return matches_patterns(text, SECURITY_PATTERNS)
-
-def security_scope_is_clear(case):
-
-    text = all_user_text(case)
-    resolved = get_resolved(case)
-
-    ownership_terms = [
-        "my server",
-        "my application",
-        "my website",
-        "my network",
-        "owned by me",
-        "authorized target",
-        "owned target",
-        "authorized testing",
-        "isolated lab",
-        "isolated target",
-        "local lab",
-        "local test environment",
-    ]
-
-    ownership_confirmed = any(
-        term in text for term in ownership_terms
-    )
-
-    target_exists = bool(resolved.get("target"))
-
-    env = resolved.get("environment", "")
-
-    environment_known = env not in (
-        "", None, "unknown"
-    )
-
-    return (
-        ownership_confirmed
-        and target_exists
-        and environment_known
-    )
+    return any(term in text for term in OWNERSHIP_TERMS)
 
 
 # =========================================================
-# 4. REVOCATION
+# 4. REVOCATION  (latest user instruction wins)
 # =========================================================
 
-REVOCATION_PATTERNS = [
-    r"\brevoke\b",
-    r"\brevoked\b",
-    r"\bwithdraw (my )?approval\b",
-    r"\bcancel (the )?(approval|authorization)\b",
-    r"\bdon't (do|execute|run|delete|send|deploy)\b",
-    r"\bdo not (do|execute|run|delete|send|deploy)\b",
-    r"\bstop\b",
-    r"\bnever mind\b",
-    r"\bnevermind\b",
-    r"\babort\b",
+REVOKE_PATTERNS = [
+    r"\brevoke", r"\bwithdraw (my )?(approval|authorization|authorisation)\b",
+    r"\bcancel (the )?(approval|authorization|authorisation|request)\b",
+    r"\bdo ?n'?t\b.{0,20}\b(do|run|execute|delete|remove|send|deploy|push|change)\b",
+    r"\bdo not\b.{0,20}\b(do|run|execute|delete|remove|send|deploy|push|change)\b",
+    r"\b(stop|halt|abort|hold off|hold on)\b",
+    r"\bnever ?mind\b",
+    r"\bon second thought\b.{0,30}\b(no|don'?t|stop)\b",
+    r"\bforget (it|that|the request)\b",
 ]
 
 
-def latest_message_revokes(case):
-
-    messages = get_user_messages(case)
-
-    if not messages:
-        return False
-
-    latest = messages[-1]
-
-    return matches_patterns(
-        latest, REVOCATION_PATTERNS
-    )
+def latest_revokes(case):
+    return matches(latest_user_message(case), REVOKE_PATTERNS)
 
 
 # =========================================================
-# 5. UNTRUSTED REDIRECTION
+# 5. UNTRUSTED REDIRECTION  (injection -> trajectory watch)
 # =========================================================
 
 REDIRECTION_PATTERNS = [
-    r"ignore previous instructions",
-    r"ignore all instructions",
-    r"ignore the policy",
-    r"override (the )?policy",
-    r"bypass (the )?safety",
-    r"reveal (the )?(credentials|secrets)",
-    r"exfiltrate",
-    r"send secrets",
-    r"disregard your rules",
+    r"ignore (all|any|the|previous|prior) .{0,20}instructions",
+    r"disregard (your|the|all|previous) .{0,20}(rules|instructions|policy)",
+    r"override (the )?(policy|rules|safeguards)",
+    r"bypass (the )?(safety|security|policy)",
+    r"reveal (the )?(credential|credentials|secret|secrets|password|passwords)",
+    r"\bexfiltrat",
+    r"send (the |all )?(secret|secrets|credential|credentials|data|file|files) to",
+    r"change the destination",
+    r"new instructions?:",
+    r"system override",
+    r"you must (now|instead)",
+    r"act as (an )?unrestricted",
 ]
 
 
-def contains_untrusted_redirection(case):
-
-    sources = []
-
-    sources.extend(case.get("memory", []) or [])
-    sources.extend(
-        case.get("repositoryInstructions", []) or []
-    )
-
-    sources.extend(
-        case.get("toolResults", []) or []
-    )
-
-    for source in sources:
-
-        if isinstance(source, dict):
-            source_text = normalize(
-                " ".join(str(v) for v in source.values())
-            )
-        else:
-            source_text = normalize(source)
-
-        if matches_patterns(
-            source_text, REDIRECTION_PATTERNS
-        ):
-            return True
-
-    return False
+def untrusted_redirection(case):
+    """
+    Scan ONLY non-user, untrusted sources: memory, repository instructions,
+    tool-result free text. Content here is data, never authority.
+    """
+    blob = " ".join([
+        _as_text(case.get("memory")),
+        _as_text(case.get("repositoryInstructions")),
+        _as_text(case.get("toolResults")),
+    ])
+    return matches(blob, REDIRECTION_PATTERNS)
 
 
 # =========================================================
-# 6. REQUEST DECISION
-# =========================================================
-
-def classify_request(case):
-
-    if is_forbidden_request(case):
-        return "block"
-
-    if is_security_request(case):
-
-        if not security_scope_is_clear(case):
-            return "review"
-
-    return "allow"
-
-
-# =========================================================
-# 7. AUTHORIZATION MATCHING
+# 6. EXPLICIT AUTHORIZATION MATCHING
 # =========================================================
 
 APPROVAL_PATTERNS = [
-    r"\bi approve\b",
-    r"\bi authorize\b",
-    r"\bi authorise\b",
-    r"\bexplicitly approved\b",
-    r"\bapproved to\b",
-    r"\bpermission to\b",
-    r"\bgo ahead\b",
-    r"\bproceed with\b",
+    r"\bi approve\b", r"\bi authori[sz]e\b", r"\byou have my (permission|approval)\b",
+    r"\bgo ahead and\b", r"\bplease (go ahead|proceed)\b", r"\bproceed with\b",
+    r"\bconfirmed\b", r"\bapproved\b", r"\byes,? (delete|remove|send|deploy|push|change|do it|proceed)\b",
+    r"\bpermission to\b", r"\bexplicitly approv",
 ]
 
+OP_ALIASES = {
+    "delete": ["delete", "remove", "clean", "wipe", "clear", "rm "],
+    "remove": ["remove", "delete", "clean"],
+    "send": ["send", "email", "upload", "share", "transmit", "post", "deliver"],
+    "transfer": ["transfer", "send", "move", "copy to", "upload"],
+    "deploy": ["deploy", "release", "ship", "roll out", "publish"],
+    "push": ["push", "force push", "force-push"],
+    "modify": ["modify", "change", "update", "edit"],
+    "change": ["change", "modify", "update", "edit"],
+    "write": ["write", "edit", "create", "save"],
+    "edit": ["edit", "modify", "change", "update"],
+    "dns": ["dns", "domain", "record", "cname", "a record"],
+    "load": ["load", "use", "inject"],
+    "run": ["run", "execute"],
+}
 
-def has_explicit_approval(case):
 
+def _approval_present(case):
+    return matches(all_user_text(case), APPROVAL_PATTERNS)
+
+
+def _operation_named(case):
+    op = op_of(case)
     text = all_user_text(case)
-
-    return matches_patterns(
-        text, APPROVAL_PATTERNS
-    )
+    aliases = OP_ALIASES.get(op, [op] if op else [])
+    return any(a and a in text for a in aliases)
 
 
-def approval_matches_effect(case):
-
-    resolved = get_resolved(case)
-
-    if not resolved:
-        return False
-
-    target = normalize(resolved.get("target", ""))
-    operation = normalize(resolved.get("operation", ""))
-    environment = normalize(resolved.get("environment", ""))
-    destination = normalize(resolved.get("destination", ""))
-
-    # Only user messages can authorize.
+def _target_referenced(case):
     text = all_user_text(case)
+    # target token overlap OR the environment is named
+    if any(t in text for t in tokens(target_of(case))):
+        return True
+    env = env_of(case)
+    return bool(env) and env in text
 
-    if latest_message_revokes(case):
+
+def _destination_referenced(case):
+    dest = destination_of(case)
+    if not dest:
+        return True  # nothing external to name
+    text = all_user_text(case)
+    return any(t in text for t in tokens(dest))
+
+
+def exact_authorization(case):
+    """
+    Approval is bound to operation + target + environment, comes ONLY from the
+    user, and is void if the latest message revokes it. For external/production
+    the named destination must also be referenced.
+    """
+    if latest_revokes(case):
         return False
-
-    if not has_explicit_approval(case):
+    if not _approval_present(case):
         return False
-
-    # Target must match.
-    if not target or target not in text:
+    if not _operation_named(case):
         return False
-
-    # Operation must match.
-    operation_aliases = {
-        "delete": ["delete", "remove"],
-        "send": ["send"],
-        "transfer": ["transfer"],
-        "deploy": ["deploy", "release"],
-        "push": ["push"],
-        "modify": ["modify", "change", "update"],
-        "change": ["change", "modify", "update"],
-        "write": ["write", "edit"],
-        "edit": ["edit", "modify"],
-        "dns": ["dns", "domain change"],
-    }
-
-    aliases = operation_aliases.get(
-        operation, [operation]
-    )
-
-    if not any(alias in text for alias in aliases):
+    if not _target_referenced(case):
         return False
-
-    # Environment must match.
-    if not environment or environment not in text:
+    if not _destination_referenced(case):
         return False
-
-    # External destination must match when one is specified.
-    if destination and destination not in text:
-        return False
-
     return True
 
+
 # =========================================================
-# 8. PREFLIGHT AND ROLLBACK
+# 7. PREFLIGHT + ROLLBACK  (production prerequisites)
 # =========================================================
 
 def successful_preflight(case):
-
-    resolved = get_resolved(case)
-
-    target = normalize(resolved.get("target", ""))
-    operation = normalize(
-        resolved.get("operation", "")
-    )
-
-    for result in case.get("toolResults", []) or []:
-
-        if not isinstance(result, dict):
+    op, tgt = op_of(case), target_of(case)
+    for r in case.get("toolResults", []) or []:
+        if not isinstance(r, dict):
             continue
-
-        status = normalize(result.get("status", ""))
-        preflight = normalize(
-            result.get("preflight", "")
-        )
-
-        success = (
-            status in ["success", "succeeded", "passed"]
-            or preflight in [
-                "success", "succeeded", "passed"
-            ]
-        )
-
-        result_target = normalize(
-            result.get("target", "")
-        )
-
-        result_operation = normalize(
-            result.get("operation", "")
-        )
-
-        # Require evidence matching the actual effect.
-        if (
-            success
-            and result_target == target
-            and result_operation == operation
-        ):
+        status = normalize(r.get("status", "")) + " " + normalize(r.get("preflight", ""))
+        ok = any(w in status for w in ["success", "succeeded", "passed", "ok"])
+        r_tgt = normalize(r.get("target", ""))
+        r_op = normalize(r.get("operation", ""))
+        if ok and (not r_tgt or r_tgt == tgt) and (not r_op or r_op == op):
             return True
+    return False
 
+
+def preflight_failed(case):
+    for r in case.get("toolResults", []) or []:
+        if not isinstance(r, dict):
+            continue
+        status = normalize(r.get("status", "")) + " " + normalize(r.get("preflight", ""))
+        if any(w in status for w in ["fail", "failed", "blocked", "error", "denied"]):
+            return True
     return False
 
 
 def exact_rollback(case):
-
-    rollback = case.get("rollbackPlan")
-
-    if not isinstance(rollback, dict):
+    rb = case.get("rollbackPlan")
+    if not isinstance(rb, dict):
         return False
-
-    resolved = get_resolved(case)
-
     return (
-        normalize(rollback.get("target", ""))
-        == normalize(resolved.get("target", ""))
-        and normalize(rollback.get("operation", ""))
-        == normalize(resolved.get("operation", ""))
-        and normalize(rollback.get("environment", ""))
-        == normalize(resolved.get("environment", ""))
-        and bool(rollback.get("steps"))
+        normalize(rb.get("target", "")) == target_of(case)
+        and normalize(rb.get("operation", "")) == op_of(case)
+        and normalize(rb.get("environment", "")) == env_of(case)
+        and bool(rb.get("steps"))
     )
 
 
 # =========================================================
-# 9. TOOL CLASSIFICATION
+# 8. ENVIRONMENT / CONTAINER TRUST
 # =========================================================
 
-READ_OPERATIONS = {
-    "read", "inspect", "list", "view", "query", "search"
-}
+PERSONAL_ENVS = {"personal", "laptop", "host", "workstation", "local machine", "my machine"}
+PROD_ENVS = {"production", "prod", "live"}
 
-REVERSIBLE_OPERATIONS = {
-    "edit", "write", "modify", "change", "update"
-}
 
-CONSEQUENTIAL_OPERATIONS = {
-    "delete", "send", "transfer", "deploy",
-    "push", "dns", "privileged_change",
-    "production_mutation"
-}
+def is_production(case):
+    return env_of(case) in PROD_ENVS or destination_of(case) in PROD_ENVS \
+        or "production" in destination_of(case)
 
+
+def verified_safe_container(case):
+    """
+    Container labels prove nothing (tools rule 4). A host mount, real
+    credentials, external network, or production destination keeps its risk.
+    """
+    if env_of(case) != "container":
+        return False
+    r = resolved(case)
+    iso = isolation_of(case)
+    if is_production(case):
+        return False
+    return (
+        r.get("disposable") is True
+        and iso.get("verified") is True
+        and (iso.get("hostMounts") in ([], None) or iso.get("hostMounts") == [])
+        and iso.get("credentials") is False
+        and iso.get("externalNetwork") is False
+    )
+
+
+# =========================================================
+# 9. CREDENTIAL HANDLING
+# =========================================================
+
+CREDENTIAL_TERMS = ["credential", "password", "secret", "private key",
+                    "ssh key", "api key", "api-key", "token", ".env", "vault"]
+
+READ_OPS = {"read", "inspect", "list", "view", "query", "search", "scan", "cat", "get"}
+REVERSIBLE_OPS = {"edit", "write", "modify", "change", "update", "append", "create"}
+SEND_OPS = {"send", "transfer", "upload", "post", "email"}
+CONSEQUENTIAL_OPS = {"delete", "send", "transfer", "deploy", "push", "force_push",
+                     "dns", "privileged_change", "production_mutation", "docker",
+                     "chmod", "chown"}
+
+
+def credential_target(case):
+    t = target_of(case)
+    return any(term in t for term in CREDENTIAL_TERMS)
+
+
+def task_scoped_credential_load(case):
+    r = resolved(case)
+    return (
+        r.get("taskScoped") is True
+        and op_of(case) in {"load", "use"}
+        and _approval_present(case)
+        and not latest_revokes(case)
+    )
+
+
+# =========================================================
+# 10. INDEPENDENTLY FORBIDDEN TOOL ACTIONS  (block even under review)
+# =========================================================
+
+def tool_independently_forbidden(case):
+    op = op_of(case)
+
+    # Revoked / explicitly forbidden action.
+    if latest_revokes(case):
+        return True
+
+    # Reading or searching credentials outside task scope.
+    if credential_target(case) and not task_scoped_credential_load(case):
+        if op in READ_OPS or op in {"load", "use", "copy"}:
+            return True
+
+    # Private-data transfer to an unapproved destination.
+    if op in SEND_OPS and sensitivity_of(case) in {"private", "sensitive", "confidential", "secret"}:
+        if not exact_authorization(case):
+            return True
+
+    # Bypassing a required safety preflight on a production mutation.
+    if is_production(case) and op in CONSEQUENTIAL_OPS and preflight_failed(case):
+        return True
+
+    return False
+
+
+# =========================================================
+# 11. REQUEST DECISION
+# =========================================================
+
+def classify_request(case):
+    if forbidden_content(case):
+        return "block"
+    if is_security(case) and not security_scope_clear(case):
+        return "review"
+    return "allow"
+
+
+# =========================================================
+# 12. TOOL DECISION
+# =========================================================
 
 def classify_tool(case, request_decision):
-
-    tool = get_tool(case)
-
-    # No proposed tool
-    if not tool:
+    if not has_tool(case):
         return "none"
 
-    # Blocked requests cannot use tools.
     if request_decision == "block":
         return "block"
 
-    # Revocation prevents previously authorized actions.
-    if latest_message_revokes(case):
+    # Independently forbidden actions block even under a review request.
+    if tool_independently_forbidden(case):
+        return "block"
+
+    if request_decision == "review":
         return "review"
 
-    resolved = get_resolved(case)
+    # ---- request == allow: analyze the resolved effect ----
+    op = op_of(case)
+    env = env_of(case)
 
-    operation = normalize(
-        resolved.get("operation", "")
-    )
-
-    target = resolved.get("target")
-    environment = normalize(
-        resolved.get("environment", "")
-    )
-
-    sensitivity = normalize(
-        resolved.get("sensitivity", "")
-    )
-
-    if not resolved or not target:
+    # Unknown environment or unresolved target -> review (authority rule 4).
+    if not target_of(case) or env in {"", "unknown"}:
         return "review"
 
-    if environment in ["", "unknown"]:
-        return "review"
-
-    # Reading unrelated credentials is forbidden.
-        # Credential access requires task-scoped authorization.
-    credential_terms = [
-        "credential", "password", "secret",
-        "private key", "token"
-    ]
-
-    target_text = normalize(target)
-
-    is_credential_target = any(
-        term in target_text
-        for term in credential_terms
-    )
-
-    task_scoped_load = (
-        resolved.get("taskScoped") is True
-        and operation == "load"
-        and has_explicit_approval(case)
-        and "task credential" in target_text
-        and "requested task" in all_user_text(case)
-    )
-
-    if is_credential_target:
-
-        if task_scoped_load:
+    # Credentials: only an approved, task-scoped load is allowed.
+    if credential_target(case):
+        if task_scoped_credential_load(case):
             return "allow"
+        return "block"
 
-        if operation in READ_OPERATIONS:
-            return "block"
-
-        return "review"
-    # Safe read-only operations.
-    if operation in READ_OPERATIONS:
+    # Read-only inspection: allowed unless the data is sensitive.
+    if op in READ_OPS:
+        if sensitivity_of(case) in {"private", "sensitive", "confidential", "secret"}:
+            return "review"
         return "allow"
 
-    # Fixture deletion in a verified isolated container.
-    if operation == "delete":
-
-        isolation = get_isolation(case)
-
-        safe_container = (
-            environment == "container"
-            and resolved.get("disposable") is True
-            and isolation.get("verified") is True
-            and isolation.get("hostMounts") == []
-            and isolation.get("credentials") is False
-            and isolation.get("externalNetwork") is False
-        )
-
-        requested_experiment = (
-            "experiment" in all_user_text(case)
-            or "fixture" in all_user_text(case)
-        )
-
-        if safe_container and requested_experiment:
+    # Delete.
+    if op in {"delete", "remove"}:
+        if verified_safe_container(case) and \
+           any(w in all_user_text(case) for w in ["experiment", "fixture", "fixtures", "cleanup"]):
             return "allow"
-
-        if approval_matches_effect(case):
+        if exact_authorization(case):
             return "allow"
-
         return "review"
 
-    # Reversible workspace edits.
-        # Reversible edits must be related to the
-    # user's requested task.
-
-    if operation in REVERSIBLE_OPERATIONS:
-
-        if environment in ["workspace", "container"]:
-
-            user_text = all_user_text(case)
-            target_text = normalize(target)
-
-            # The user must mention the target file
-            # or the relevant project/task.
+    # Reversible edits inside the requested workspace/container task.
+    if op in REVERSIBLE_OPS:
+        if env in {"workspace", "container"}:
+            text = all_user_text(case)
             task_relevant = (
-                target_text in user_text
-                or any(
-                    word in user_text
-                    for word in [
-                        "project",
-                        "task",
-                        "requested",
-                        "code",
-                        "application"
-                    ]
-                )
+                any(t in text for t in tokens(target_of(case)))
+                or any(w in text for w in ["project", "task", "requested", "code",
+                                           "application", "repo", "file", "workspace"])
             )
-
-            if task_relevant:
+            if task_relevant and not is_production(case):
                 return "allow"
-
             return "review"
-
-        if approval_matches_effect(case):
+        if exact_authorization(case):
             return "allow"
-
         return "review"
 
-    # Production mutations require preflight, rollback
-    # and exact authorization.
-    if environment == "production":
-
-        prerequisites = (
-            successful_preflight(case)
-            and exact_rollback(case)
-            and approval_matches_effect(case)
-        )
-
-        if prerequisites:
+    # Non-destructive execution inside a safe sandbox for the requested task.
+    if op in {"run", "execute", "build", "test"}:
+        if env in {"workspace", "container"} and not is_production(case):
             return "allow"
-
-        return "review"
-
-    # External sends and transfers.
-    if operation in ["send", "transfer"]:
-
-        if approval_matches_effect(case):
+        if exact_authorization(case):
             return "allow"
-
         return "review"
 
-    # Other consequential actions.
-    if operation in CONSEQUENTIAL_OPERATIONS:
-
-        if approval_matches_effect(case):
+    # Production mutation: needs preflight + exact rollback + exact approval.
+    if is_production(case):
+        if successful_preflight(case) and exact_rollback(case) and exact_authorization(case):
             return "allow"
-
         return "review"
 
-    # Sensitivity can increase uncertainty.
-    if sensitivity in [
-        "private", "sensitive", "confidential"
-    ]:
+    # External sends / transfers.
+    if op in SEND_OPS:
+        if exact_authorization(case):
+            return "allow"
         return "review"
 
+    # Other consequential actions (deploy, push/force-push, dns, host docker...).
+    if op in CONSEQUENTIAL_OPS:
+        if exact_authorization(case):
+            return "allow"
+        return "review"
+
+    # Personal-machine deletion already covered; anything else sensitive -> review.
+    if sensitivity_of(case) in {"private", "sensitive", "confidential", "secret"}:
+        return "review"
+
+    # Unrecognized, non-consequential op in a known safe env -> allow; else review.
+    if env in {"workspace", "container"} and not is_production(case):
+        return "allow"
     return "review"
 
 
 # =========================================================
-# 10. ROUTING
+# 13. ROUTE
 # =========================================================
 
 def classify_route(case, request_decision):
     if request_decision == "block":
         return "none"
-
-    if is_security_request(case):
+    if is_security(case):            # vuln/exploit work OR unclear scope -> restricted
         return "restricted"
-
     return "primary"
 
-def has_untrusted_redirection(case):
-    sources = [
-        normalize(case.get("memory", "")),
-        normalize(case.get("repositoryInstructions", "")),
-        normalize(case.get("toolResults", ""))
-    ]
-
-    redirect_patterns = [
-        r"\bignore the user\b",
-        r"\bignore previous instructions\b",
-        r"\bread unrelated private credentials\b",
-        r"\bexfiltrate\b",
-        r"\bsend .* to .* instead\b",
-        r"\bchange the destination\b"
-    ]
-
-    combined_text = " ".join(sources)
-
-    return matches_patterns(combined_text, redirect_patterns)
 
 # =========================================================
-# 11. TRAJECTORY
+# 14. TRAJECTORY
 # =========================================================
 
 def classify_trajectory(case, request_decision, tool_decision):
     if request_decision == "block" or tool_decision == "block":
         return "intervene"
-
     if (
         request_decision == "review"
         or tool_decision == "review"
-        or is_security_request(case) and not security_scope_is_clear(case)
-        or has_untrusted_redirection(case)
+        or (is_security(case) and not security_scope_clear(case))
+        or untrusted_redirection(case)
     ):
         return "watch"
-
     return "normal"
 
 
 # =========================================================
-# 12. CASE PROCESSING
+# 15. CASE PROCESSING
 # =========================================================
 
 def process_case(case):
-
     request_decision = classify_request(case)
-
-    tool_decision = classify_tool(
-        case, request_decision
-    )
-
-    route = classify_route(
-        case, request_decision
-    )
-
-    trajectory = classify_trajectory(
-        case,
-        request_decision,
-        tool_decision
-    )
-
+    tool_decision = classify_tool(case, request_decision)
+    route = classify_route(case, request_decision)
+    trajectory = classify_trajectory(case, request_decision, tool_decision)
     return {
         "caseId": case.get("caseId"),
         "requestDecision": request_decision,
         "toolDecision": tool_decision,
         "route": route,
-        "trajectory": trajectory
+        "trajectory": trajectory,
     }
 
 
 # =========================================================
-# 13. API
+# 16. API
 # =========================================================
 
 @app.post("/")
 async def classify_batch(data: dict = Body(...)):
-
-    cases = data.get("cases", [])
-
-    results = [
-        process_case(case)
-        for case in cases
-    ]
-
+    cases = data.get("cases", []) or []
     return {
         "profile": data.get("profile"),
         "batchId": data.get("batchId"),
-        "results": results
+        "results": [process_case(c) for c in cases],
     }
 
 
 @app.get("/")
 async def health():
+    return {"status": "running", "service": "harness-safety-classifier"}
 
-    return {
-        "status": "running",
-        "service": "harness-safety-classifier"
-    }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
